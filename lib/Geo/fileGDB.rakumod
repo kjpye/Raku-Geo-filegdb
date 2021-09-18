@@ -3,10 +3,9 @@ sub mmap(Pointer $addr, int32 $length, int32 $prot, int32 $flags, int32 $fd, int
 
 my $dbg = 0;
 
-class Value {
+class FieldValue {
     has $.val;
-    has $.sql;
-    has $.copy;
+    has $.type = 1; # 0 -> none; 1 -> value; 2 -> string; 3 -> geometry
 }
 
 class Table does Iterable does Iterator {
@@ -319,11 +318,11 @@ class Table does Iterable does Iterator {
                 when 1 {
                     my $val = read-int32($!bytes, $pointer); $pointer += 4;
                     note "$val ({$val.base(16)}" if $dbg;
-                    $value = Value.new(val => $val, sql => ~$val, copy => ~$val);
+                    $value = FieldValue.new(:$val, type => 1);
                 }
                 when 3 {
                     my $val = read-float64($!bytes, $pointer); $pointer += 8;
-                    $value = Value.new(val => $val, sql => ~$val, copy => ~$val);
+                    $value = FieldValue.new(:$val, type => 1);
                     dd $value if $dbg;
                 }
                 when 4|12 {
@@ -333,22 +332,20 @@ class Table does Iterable does Iterator {
                         @array.push: $!bytes[$pointer++];
                     }
                     my $val = Blob.new(@array).decode;
-                    my $sval = make-string($val);
-                    $value = Value.new(val  => $val,
-                                       sql  => "E'$sval'",
-                                       copy => $sval
-                                      );
+                    $value = FieldValue.new(:$val,
+                                            type => 2,
+                                           );
                     dd $value if $dbg;
                 }
                 when 5 {
                     my $time = read-float64($!bytes, $pointer); $pointer += 8;
                     dd $time if $dbg;
                     my $val = ($epoch.later(day => $time));
-                    $value = Value.new(val => $val, sql => "'$val'");
+                    $value = FieldValue.new(:$val, type => 2);
                     dd $value if $dbg;
                 }
                 when 6 {
-                    $value = Value.new(val => Nil, sql => Nil);
+                    $value = FieldValue.new(val => Nil, type => 0);
                     dd $value if $dbg;
                 }
                 when 7 {
@@ -375,9 +372,8 @@ class Table does Iterable does Iterator {
                                 my $m = read-varuint($!bytes, $pointer);
                                 @vals.push: ($m-1) ÷ $field<mscale> + $field<morigin>;
                             }
-                            my $val1 = "ST_GeomFromText('{$type}(" ~ @vals.join(' ') ~ ")', 4326)";
-                            my $val2 = "SRID=4326;{$type}(" ~ @vals.join(' ') ~ ")";
-                            $value = Value.new(val => $val1, sql => $val1, copy => $val2);
+                            my $val = @vals.join(' ');
+                            $value = FieldValue.new(val => wkt($type, @vals), type => 3);
                         }
                         when 8|18|20|28|50 { # polyline
                             my @points;
@@ -407,10 +403,7 @@ class Table does Iterable does Iterator {
                                 }
                             }
                             my $val = @points.map({.join(' ')}).join(',');
-                            $value = Value.new(val => @points,
-                                               sql => "ST_GeomFromText('MULTILINESTRING(({$val})', 4326)",
-                                               copy => "SRID=4326;MULTILINESTRING(($val))"
-                                                    );
+                            $value = FieldValue.new(val => wkt('MULTILINESTRING', @points, type => 3), type => 3);
                         }
                         when 5|51 { # polygon
                             my @points;
@@ -441,10 +434,7 @@ class Table does Iterable does Iterator {
                             }
                             @points.push(@points[0]) unless @points[*-1] === @points[0];
                             my $val = @points.map({.join(' ')}).join(',');
-                            $value = Value.new(val => @points,
-                                               sql => "ST_GeomFromText('MULTIPOLYGON((({$val}))', 4326)",
-                                               copy => "SRID=4326;MULTIPOLYGON(($val))"
-                                                    );
+                            $value = FieldValue.new(val => wkt('MULTIPOLYGON', @points), type => 3);
                         }
                         default {
                             die "Unknown geometry type $geometry-type ({$geometry-type.base(16)})";
@@ -460,16 +450,83 @@ class Table does Iterable does Iterator {
         %row;
     }
 
+    sub wkt($type, $vals) {
+        given $type {
+            when 'POINT'|'POINTZ'|'POINTM'|'POINTZM' {
+                $type ~ '(' ~ $vals.join(' ') ~ ')';
+            }
+            when 'MULTILINESTRING' {
+                $type ~ '((' ~ $vals.map({.join(' ')}).join(',') ~ '))';
+            }
+            when 'MULTIPOLYGON' {
+                $vals.push($vals[0]) unless $vals[*-1] === $vals[0];
+                '((' ~ $vals.map({.join(' ')}).join(',') ~ '))';
+            }
+            default {
+                X::ADHOC.new("Unknown WKT geometry type")
+            }
+        }
+    }
+        
+    sub wkt-to-insert($wkt is copy) {
+        $wkt ~~ s/'('/ST_GeomFromText(/;
+        $wkt ~~ s/')'$/), 4362)/;
+        $wkt;
+    }
+    
+    sub wkt-to-copy($wkt) {
+        'SRID=4362;' ~ $wkt;
+    }
+    
     method make-insert($row, :$name = 'XXX') {
         my @columns;
         my @values;
         for @!fields -> $field {
             my $field-name = $field<name>;
-            next unless $row{$field-name} && $row{$field-name}.sql;
-            @columns.push: $field-name;
-            @values.push:  $row{$field-name}.sql;
+            if $row{$field-name}.val.defined {
+                given $row{$field-name}.type {
+                    when 0 { # don't generate entry
+                    }
+                    when 1 { # just straight Numeric?) value
+                        @columns.push: $field-name;
+                        @values.push:  $row{$field-name}.val // '\N';
+                    }
+                    when 2 { # string value
+                        @columns.push: $field-name;
+                        @values.push:  "E'" ~ make-string($row{$field-name}.val) ~ "'";
+                    }
+                    when 3 { # geometry
+                        @columns.push: $field-name;
+                        @values.push:  wkt-to-insert($row{$field-name}.val);
+                    }
+                    
+                    @columns.push: $field-name;
+                    @values.push:  $row{$field-name}.sql;
+                }
+            }
         }
         "INSERT INTO $name (" ~ @columns.join(', ') ~ ") VALUES (" ~ @values.join(', ') ~ ");";
+    }
+    
+    method make-copy($row, :$name = 'XXX') {
+        my @values;
+        for @!fields -> $field {
+            next if $field<type> == 6; # auto fields
+            my $field-name = $field<name>;
+            if $row{$field-name}.defined && $row{$field-name}.val.defined {
+                given $row{$field-name}.type {
+                    when 0 { # don't generate entry
+                    }
+                    when 1|2 { # just straight numeric or string value
+                        @values.push:  $row{$field-name}.val // '\N';
+                    }
+                    when 3 { # geometry
+                        @values.push:  wkt-to-copy($row{$field-name}.val);
+                    }
+                }
+            }
+        }
+        @values.join("\t");
     }
     
     method make-copy-cmd($file, :$table = 'XXX') {
@@ -478,21 +535,6 @@ class Table does Iterable does Iterator {
             @columns.push: $field<name> unless $field<type> == 6;
         }
         "COPY $table (" ~ @columns.join(', ') ~ ") from '$file';";
-    }
-    
-    method make-copy($row, :$name = 'XXX') {
-        my @columns;
-        my @values;
-        for @!fields -> $field {
-            next if $field<type> == 6;
-            my $field-name = $field<name>;
-            if $row{$field-name}.defined && $row{$field-name}.sql {
-                @values.push:  $row{$field-name}.copy // $row{$field-name}.sql;
-            } else {
-                @values.push: '\N';
-            }
-        }
-        @values.join("\t");
     }
     
     method create-table(:$name = 'XXX') {
