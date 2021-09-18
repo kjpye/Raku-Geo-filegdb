@@ -508,7 +508,7 @@ class Table does Iterable does Iterator {
         "INSERT INTO $name (" ~ @columns.join(', ') ~ ") VALUES (" ~ @values.join(', ') ~ ");";
     }
     
-    method make-copy($row, :$name = 'XXX') {
+    method make-copy($row) {
         my @values;
         for @!fields -> $field {
             next if $field<type> == 6; # auto fields
@@ -523,13 +523,16 @@ class Table does Iterable does Iterator {
                     when 3 { # geometry
                         @values.push:  wkt-to-copy($row{$field-name}.val);
                     }
+                    default {
+                        X::AdHoc.new("Unknown ValueField type {$row{$field-name}.type}");
+                    }
                 }
             }
         }
         @values.join("\t");
     }
     
-    method make-copy-cmd($file, :$table = 'XXX') {
+    method make-copy-cmd($file) {
         my @columns;
         for @!fields -> $field {
             @columns.push: $field<name> unless $field<type> == 6;
