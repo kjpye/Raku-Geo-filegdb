@@ -1,15 +1,13 @@
+use Geo::Geometry;
+
 use NativeCall;
 sub mmap(Pointer $addr, int32 $length, int32 $prot, int32 $flags, int32 $fd, int32 $offset) returns CArray[uint8] is native {*}
 
 my $dbg = 0;
 
-class FieldValue {
-    has $.val;
-    has $.type = 1; # 0 -> none; 1 -> value; 2 -> string; 3 -> geometry
-}
-
 class Table does Iterable does Iterator {
-    has $!num-rows;
+    has $.num-rows;
+
     has $!field-offset;
     has $!nullable-fields;
     has $!layer-flags;
@@ -21,6 +19,7 @@ class Table does Iterable does Iterator {
     has @!fields;
     has $!bytes;
     has $!offsets;
+    has $!row-num;
 
     my $epoch = DateTime.new(year => 1899,
                              month => 12,
@@ -39,10 +38,12 @@ class Table does Iterable does Iterator {
     }
 
     method iterator() { self }
+    
     method pull-one ( --> Mu ) {
         if $!remaining-rows {
             my $offset = 0;
             while !$offset && $!remaining-rows {
+                $!row-num++;
                 my $shift = 0;
                 for ^$!size-offset {
                     $offset += ($!offsets[$!offset-pointer++] +& 0xff) +< $shift;
@@ -50,7 +51,9 @@ class Table does Iterable does Iterator {
                 }
                 $!remaining-rows--;
             }
-            self.read-row($offset);
+            my $row = self.read-row($offset);
+            $row<.row-num.> = $!row-num;
+            $row;
         } else {
             IterationEnd;
         }
@@ -280,6 +283,26 @@ class Table does Iterable does Iterator {
         $s;
     }
     
+    method read-point($pointer is rw, $field) {
+        my $x = read-varuint($!bytes, $pointer) / $field<xyscale> + $field<xorigin>;
+        my $y = read-varuint($!bytes, $pointer) / $field<xyscale> + $field<yorigin>;
+        my $z = read-varuint($!bytes, $pointer) / $field<zscale> + $field<zorigin> if $!has-z;
+        my $m = read-varuint($!bytes, $pointer) / $field<mscale> + $field<morigin> if $!has-m;
+        if $!has-z {
+            if $!has-m {
+                PointZM.new($x, $y, $z, $m);
+            } else {
+                PointZ.new($x, $y, $z);
+            }
+        } else {
+            if $!has-m {
+                PointM.new($x, $y, $m);
+            } else {
+                Point.new($x, $y);
+            }
+        }
+    }
+
     method read-row($pointer is copy) {
         my %row;
         note "Reading row at offset {$pointer.base(16)}" if $dbg;
@@ -288,8 +311,8 @@ class Table does Iterable does Iterator {
         dd $field-count if $dbg;
         # read null field bits
         my @null = ();
-        for ^(($!nullable-fields)/8) {
-            @null.push($!bytes[$pointer++] +^ 0xff);
+        for ^(($!nullable-fields+7) div 8) {
+            @null.push($!bytes[$pointer++] +& 0xff);
         }
         @null.push(0);
         dd @null if $dbg;
@@ -307,7 +330,7 @@ class Table does Iterable does Iterator {
                 }
                 dd $null-mask if $dbg;
                 note $null-byte.base(16) if $dbg;
-                if $null-byte +& $null-mask == 0 { # field is null
+                if $null-byte +& $null-mask != 0 { # field is null
                     note "{$field<name>} IS NULL" if $dbg;
                     %row{$field<name>} = Nil;
                     next;
@@ -316,13 +339,11 @@ class Table does Iterable does Iterator {
             }
             given $field<type> {
                 when 1 {
-                    my $val = read-int32($!bytes, $pointer); $pointer += 4;
-                    note "$val ({$val.base(16)}" if $dbg;
-                    $value = FieldValue.new(:$val, type => 1);
+                    $value = read-int32($!bytes, $pointer); $pointer += 4;
+                    note "$value ({$value.base(16)}" if $dbg;
                 }
                 when 3 {
-                    my $val = read-float64($!bytes, $pointer); $pointer += 8;
-                    $value = FieldValue.new(:$val, type => 1);
+                    $value = read-float64($!bytes, $pointer); $pointer += 8;
                     dd $value if $dbg;
                 }
                 when 4|12 {
@@ -331,54 +352,82 @@ class Table does Iterable does Iterator {
                     for ^$length {
                         @array.push: $!bytes[$pointer++];
                     }
-                    my $val = Blob.new(@array).decode;
-                    $value = FieldValue.new(:$val,
-                                            type => 2,
-                                           );
+                    $value = Blob.new(@array).decode;
                     dd $value if $dbg;
                 }
                 when 5 {
                     my $time = read-float64($!bytes, $pointer); $pointer += 8;
                     dd $time if $dbg;
-                    my $val = ($epoch.later(day => $time));
-                    $value = FieldValue.new(:$val, type => 2);
+                    $value = ($epoch.later(day => $time));
                     dd $value if $dbg;
                 }
                 when 6 {
-                    $value = FieldValue.new(val => Nil, type => 0);
+                    $value = Nil;
                     dd $value if $dbg;
                 }
-                when 7 {
+                when 7 { # geometry
                     my $length = read-varuint($!bytes, $pointer);
                     dd $length if $dbg;
                     my $geometry-type = read-varuint($!bytes, $pointer);
-                    dd $geometry-type if $dbg;
+                    note "geometry type {$geometry-type} ({$geometry-type.base(16)})" if $dbg;
                     given $geometry-type +& 0xff {
                         when 1|9|11|21|52 { # point types
+                            $value = self.read-point($pointer, $field);
+                        }
+                        when 8|18|20|28|53 { # multipoint types
                             my @vals;
-                            my $type = 'POINT';
-                            my $x = read-varuint($!bytes, $pointer);
-                            @vals.push: $x/$field<xyscale> + $field<xorigin>;
-                            my $y = read-varuint($!bytes, $pointer);
-                            @vals.push: $y/$field<xyscale> + $field<yorigin>;
-                            dd $y if $dbg;
+                            my $type = 'MULTIPOINT';
+                            my $num-points = read-varuint($!bytes, $pointer);
+                            my $xmin = read-varuint($!bytes, $pointer) ÷ $field<xyscale> + $field<xorigin>;
+                            my $ymin = read-varuint($!bytes, $pointer) ÷ $field<xyscale> + $field<xorigin>;
+                            my $xmax = read-varuint($!bytes, $pointer) ÷ $field<xyscale> + $field<xorigin>;
+                            my $ymax = read-varuint($!bytes, $pointer) ÷ $field<xyscale> + $field<xorigin>;
+                            my $x = $field<xorigin>;
+                            my $y = $field<yorigin>;
+                            for ^$num-points {
+                                my $x += read-varuint($!bytes, $pointer) / $field<xyscale>;
+                                my $y += read-varuint($!bytes, $pointer) / $field<xyscale>;
+                                @vals.push: @($x, $y);
+                            }
                             if $!has-z {
                                 $type ~= 'Z';
-                                my $z = read-varuint($!bytes, $pointer);
-                                @vals.push: ($z-1) ÷ $field<zscale> + $field<zorigin>;
+                                my $z = $field<zorigin>;
+                                for ^$num-points -> $i {
+                                    my $z += read-varuint($!bytes, $pointer) / $field<zscale>;
+                                    @vals[$i].push: $z;
+                                }
                             }
                             if $!has-m {
                                 $type ~= 'M';
-                                my $m = read-varuint($!bytes, $pointer);
-                                @vals.push: ($m-1) ÷ $field<mscale> + $field<morigin>;
+                                for ^$num-points -> $i {
+                                    my $m = read-varuint($!bytes, $pointer) / $field<mscale> + $field<morogin>;
+                                    @vals[$i].push: $m;
+                                }
                             }
-                            my $val = @vals.join(' ');
-                            $value = FieldValue.new(val => wkt($type, @vals), type => 3);
+                            given $type {
+                                when 'MULTIPOINT' {
+                                    $value = MultiPoint.new(points => @vals.map: {Point.new($_[0], $_[1])});
+                                }
+                                when 'MULTIPOINTZ' {
+                                    $value = MultiPointZ.new(points => @vals.map: {Point.new($_[0], $_[1], $_[2])});
+                                }
+                                when 'MULTIPOINTM' {
+                                    $value = MultiPointM.new(points => @vals.map: {Point.new($_[0], $_[1], $_[2])});
+                                }
+                                when 'MULTIPOINTZM' {
+                                    $value = MultiPointZM.new(points => @vals.map: {Point.new($_[0], $_[1], $_[2], $_[3])});
+                                }
+                            }
+                            dd $value if $dbg;
                         }
-                        when 8|18|20|28|50 { # polyline
+                        when 3|10|13|23|50 { # polyline
+                            my $type = 'MULTILINESTRING';
                             my @points;
                             my @vals;
                             my $num-points = read-varuint($!bytes, $pointer);
+                            my $num-parts  = read-varuint($!bytes, $pointer);
+                            $pointer++; # what's this byte?
+                            note "line types with $num-points points in $num-parts parts" if $dbg;
                             my $xmin = read-varuint($!bytes, $pointer) ÷ $field<xyscale> + $field<xorigin>;
                             my $ymin = read-varuint($!bytes, $pointer) ÷ $field<xyscale> + $field<yorigin>;
                             my $xmax = read-varuint($!bytes, $pointer) ÷ $field<xyscale> + $field<xorigin>;
@@ -386,29 +435,48 @@ class Table does Iterable does Iterator {
                             note "bbox: $xmin → $xmax, $ymin → $ymax" if $dbg;
                             my $x = $field<xorigin>;
                             my $y = $field<yorigin>;
+                            my @part-length;
+                            for ^($num-parts - 1) {
+                                @part-length.push: read-varuint($!bytes, $pointer);
+                            }
+                            @part-length.push: $num-points - [+] @part-length; # length of final part is not explicit
                             for ^$num-points {
                                 my $dx = read-varint($!bytes, $pointer);
                                 $x += $dx ÷ $field<xyscale>;
                                 my $dy = read-varint($!bytes, $pointer);
                                 $y += $dy ÷ $field<xyscale>;
                                 my @point = ($x, $y);
-                                @points.push(@point);
+                                @points.push: @point;
                             }
                             if $!has-z {
-                                my $z = $field<zorogin>;
+                                $type ~= 'Z';
+                                my $z = $field<zorigin>;
                                 for ^$num-points -> $i {
                                     my $dz = read-varint($!bytes, $pointer);
                                     $z += $dz ÷ $field<zscale>;
                                     @points[$i].push($z);
                                 }
                             }
+                            if $!has-m {
+                                $type ~= 'M';
+                                my $m = $field<morigin>;
+                                for ^$num-points -> $i {
+                                    $m += read-varint($!bytes, $pointer) ÷ $field<mscale>;
+                                    @points[$i].push($m);
+                                }
+                            }
                             my $val = @points.map({.join(' ')}).join(',');
-                            $value = FieldValue.new(val => wkt('MULTILINESTRING', @points, type => 3), type => 3);
+                            $value = wkt($type, @points, length => @part-length);
+                            dd $value if $dbg;
                         }
-                        when 5|51 { # polygon
+                        when 5|15|19|25|51 { # polygon
+                            my $type = 'MULTIPOLYGON';
                             my @points;
                             my @vals;
                             my $num-points = read-varuint($!bytes, $pointer);
+                            my $num-parts  = read-varuint($!bytes, $pointer);
+                            $pointer++; # There's a byte in here I don't understand
+                            note "polygon type with $num-points points in $num-parts parts" if $dbg;
                             my $xmin = read-varuint($!bytes, $pointer) ÷ $field<xyscale> + $field<xorigin>;
                             my $ymin = read-varuint($!bytes, $pointer) ÷ $field<xyscale> + $field<yorigin>;
                             my $xmax = read-varuint($!bytes, $pointer) ÷ $field<xyscale> + $field<xorigin>;
@@ -416,25 +484,44 @@ class Table does Iterable does Iterator {
                             note "bbox: $xmin → $xmax, $ymin → $ymax" if $dbg;
                             my $x = $field<xorigin>;
                             my $y = $field<yorigin>;
+                            my @part-length;
+                            for ^($num-parts - 1) {
+                                @part-length.push: read-varuint($!bytes, $pointer);
+                            }
+                            @part-length.push: $num-points - [+] @part-length;
                             for ^$num-points {
                                 my $dx = read-varint($!bytes, $pointer);
                                 $x += $dx ÷ $field<xyscale>;
                                 my $dy = read-varint($!bytes, $pointer);
                                 $y += $dy ÷ $field<xyscale>;
                                 my @point = ($x, $y);
-                                @points.push(@point);
+                                @points.push: @point;
                             }
                             if $!has-z {
-                                my $z = $field<zorogin>;
+                                $type ~= 'Z';
+                                my $z = $field<zorigin>;
                                 for ^$num-points -> $i {
                                     my $dz = read-varint($!bytes, $pointer);
                                     $z += $dz ÷ $field<zscale>;
                                     @points[$i].push($z);
                                 }
                             }
-                            @points.push(@points[0]) unless @points[*-1] === @points[0];
+                            if $!has-m {
+                                $type ~= 'M';
+                                my $m = $field<morigin>;
+                                for ^$num-points -> $i {
+                                    $m += read-varint($!bytes, $pointer) ÷ $field<mscale>;
+                                    @points[$i].push($m);
+                                }
+                            }
+#dd @points[0], @points[*-1];
+                            @points.push(@points[0]) unless @points[0] eqv @points[*-1];
+#dd @points[0], @points[*-1];
+#dd @points;
                             my $val = @points.map({.join(' ')}).join(',');
-                            $value = FieldValue.new(val => wkt('MULTIPOLYGON', @points), type => 3);
+                            $value = wkt($type, @points, length => +@points);
+                            dd $value if $dbg;
+#dd $value;
                         }
                         default {
                             die "Unknown geometry type $geometry-type ({$geometry-type.base(16)})";
@@ -447,35 +534,60 @@ class Table does Iterable does Iterator {
             }
             %row{$field<name>} = $value;
         }
+        note "Finished reading row -- pointer is {$pointer.base(16)}" if $dbg;
         %row;
     }
 
-    sub wkt($type, $vals) {
+    sub wkt($type, $vals, :$length = (Inf)) {
         given $type {
             when 'POINT'|'POINTZ'|'POINTM'|'POINTZM' {
                 $type ~ '(' ~ $vals.join(' ') ~ ')';
             }
-            when 'MULTILINESTRING' {
-                $type ~ '((' ~ $vals.map({.join(' ')}).join(',') ~ '))';
+            when 'MULTIPOINT' {
+                $type ~ '(' ~ $vals.map({.join(' ')}).join(',') ~ ')';
             }
-            when 'MULTIPOLYGON' {
-                $vals.push($vals[0]) unless $vals[*-1] === $vals[0];
-                '((' ~ $vals.map({.join(' ')}).join(',') ~ '))';
+            when 'MULTILINESTRING' |
+                 'MULTILINESTRINGZ' |
+                 'MULTILINESTRINGM' |
+                 'MULTILINESTRINGZM' |
+                 'MULTIPOLYGON' |
+                 'MULTIPOLYGONZ' |
+                 'MULTIPOLYGONM' |
+                 'MULTIPOLYGONZM'
+                 {
+                my @vals;
+                dd $length if $dbg;
+                my $offset = 0;
+                for |$length -> $l {
+                    dd $l if $dbg;
+                    note "Copying values from $offset to {$offset + $l}" if $dbg;
+                    if $l >= 0 {
+                        @vals.push: $vals[$offset ..^ $offset + $l];
+                    } else {
+                        @vals.push: $vals[$offset .. *];
+                    }
+                    $offset += $l;
+                }
+                my $v = @vals.map({.map({
+                                         .join(' ')
+                                        }).join(',')
+                                  }).join('),(');
+                $type ~ '((' ~ $v ~ '))';
             }
             default {
-                X::ADHOC.new("Unknown WKT geometry type")
+                die "Unknown WKT geometry type '$type'";
             }
         }
     }
         
     sub wkt-to-insert($wkt is copy) {
         $wkt ~~ s/'('/ST_GeomFromText(/;
-        $wkt ~~ s/')'$/), 4362)/;
+        $wkt ~~ s/')'$/), 4326)/;
         $wkt;
     }
     
     sub wkt-to-copy($wkt) {
-        'SRID=4362;' ~ $wkt;
+        'SRID=4326;' ~ $wkt;
     }
     
     method make-insert($row, :$name = 'XXX') {
@@ -484,18 +596,18 @@ class Table does Iterable does Iterator {
         for @!fields -> $field {
             my $field-name = $field<name>;
             if $row{$field-name}.val.defined {
-                given $row{$field-name}.type {
-                    when 0 { # don't generate entry
+                given $row{$field-name} {
+                    default { # don't generate entry
                     }
-                    when 1 { # just straight Numeric?) value
+                    when Real { # just straight Numeric?) value
                         @columns.push: $field-name;
                         @values.push:  $row{$field-name}.val // '\N';
                     }
-                    when 2 { # string value
+                    when Str { # string value
                         @columns.push: $field-name;
                         @values.push:  "E'" ~ make-string($row{$field-name}.val) ~ "'";
                     }
-                    when 3 { # geometry
+                    when Geometry { # geometry
                         @columns.push: $field-name;
                         @values.push:  wkt-to-insert($row{$field-name}.val);
                     }
@@ -513,31 +625,44 @@ class Table does Iterable does Iterator {
         for @!fields -> $field {
             next if $field<type> == 6; # auto fields
             my $field-name = $field<name>;
-            if $row{$field-name}.defined && $row{$field-name}.val.defined {
-                given $row{$field-name}.type {
-                    when 0 { # don't generate entry
+            if $row{$field-name}.defined && $row{$field-name}.defined {
+                given $row{$field-name} {
+                    default { # don't generate entry
                     }
-                    when 1|2 { # just straight numeric or string value
-                        @values.push:  $row{$field-name}.val // '\N';
+                    when Real { # straight numeric value
+                        @values.push:  $row{$field-name} // '\N';
                     }
-                    when 3 { # geometry
-                        @values.push:  wkt-to-copy($row{$field-name}.val);
+                    when Str { # straight string value
+                        my $val = $row{$field-name};
+                        if $val.defined {
+                            $val ~~ s:g/\\/\\\\/;
+                            $val ~~ s:g/\n/\\n/;
+                            $val ~~ s:g/\r/\\r/;
+                            $val ~~ s:g/\t/\\t/;
+                            $val ~~ s:g/"\b"/\\b/;
+                        }
+                        @values.push:  $val // '\N';
                     }
-                    default {
-                        X::AdHoc.new("Unknown ValueField type {$row{$field-name}.type}");
+                    when Geometry { # geometry
+                        @values.push:  wkt-to-copy($row{$field-name});
                     }
+#                    default {
+#                        X::AdHoc.new("Unknown ValueField type {$row{$field-name}}");
+#                    }
                 }
+            } else {
+                @values.push: '\N';
             }
         }
         @values.join("\t");
     }
     
-    method make-copy-cmd($file) {
+    method make-copy-cmd($file, $table = 'XXX') {
         my @columns;
         for @!fields -> $field {
             @columns.push: $field<name> unless $field<type> == 6;
         }
-        "COPY $table (" ~ @columns.join(', ') ~ ") from '$file';";
+        "\\COPY $table (" ~ @columns.join(', ') ~ ") from '$file';";
     }
     
     method create-table(:$name = 'XXX') {
@@ -591,3 +716,64 @@ class Table does Iterable does Iterator {
         ";\n";
     }   
 }
+
+=begin pod
+=TITLE Geo::filegdb
+=head1 Geo::filegdb
+
+A class to allow easy reading of fileGDB geographic databases.
+
+=head2 Usage example
+
+=begin code
+    my $dir = '/home/user/gdb-directory'; # the directory containing the database
+    my $system-table := Geo::filegdb::Table.new($dir, table => 1);
+    for $system-table -> $row {
+        if $row<.row-num.> > 8 { # skip system tables
+            my $table := Geo::filegdb::Table.new(:$dir, $row<.row-num.>);
+            for $table -> $row {
+                # process row of data
+            }
+        }
+    }
+=end code
+
+=head1 Background
+
+FileGDB is a file format defined by ESRI and often used for transfer of geographic data information. Each database is contained in a single directory, with each database table being represented by a set of files. File names are of the form C<aXXXXXXXX.<extension>>, where C<XXXXXXXX> is a lower-case hexadecimal number. This class (at the moment) only uses files with extension C<.table> and C<.tablx> which contain the data itself and information about row positions in the data file. The other files contain information necessary and useful when the database is being actively updated and used, including indexes and information about free space.
+
+Table 1 (in files C<a00000001.table> and C<a00000001.tablx>, and usually called C<GDB_SystemCatalog>) contain the system table catalog with information about the tables in the database. The first eight tables (the number depends on the file format version, but we currently only support file version 4, correspoinding to fGDB10) contain other generic information, and not user data. The table number (and thus file names) is not stored directly in the system catalog, but is inferred from the row number in the system catalog. There are often deleted (or skipped) entries in the system catalog. These correspond to tables which are not present. Thus the file names may skip some numbers.
+
+ESRΙ do not release file format information; this module relies on the reverse-engineered information available at L<https://github.com/rouault/dump_gdbtable/wiki/FGDB-Spec>.
+
+=head1 Creating a Table
+
+C<Table.new> will return a C<Table> object which is an iterator. The C<new> method requires two named arguments. the C<dir> argument is the pathname of the directory containing the database, and the C<table> argument is the number of the table to be opened. The system table is number 1.
+
+Note that it is essential that the new Table be bound to a variable and not assigned to it.
+The C<Table> object is an iterator. If you assign it to a variable, the first row will be assigned to the variable rather than the iterator.
+
+C<Table.new> will return a Failure if it cannot open the table for whatever reason.
+
+=head1 Using the Table
+                                                                    
+The only publicly accessible attribute of a table is the number of rows, available using the C<num-rows> method.
+
+It is generally possible to use a C<Table> without actually directly calling any methods other than C<new>. In its simplest form, the following code repesents normal usage of this module:
+
+=begin code
+
+=end code
+
+=head1 Auxiliary methods
+=head2 dump
+=head2 iterator
+=head2 pull-one
+=head2 read-point
+=head2 read-row
+=head2 make-insert
+=head2 make-copy
+=head2 make-copy-cmd
+=head2 create-table
+                                                                    
+=end pod
