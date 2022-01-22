@@ -51,7 +51,7 @@ class Table does Iterable does Iterator {
                 }
                 $!remaining-rows--;
             }
-            my $row = self.read-row($offset);
+            my $row = self!read-row($offset);
             $row<.row-num.> = $!row-num;
             $row;
         } else {
@@ -283,7 +283,7 @@ class Table does Iterable does Iterator {
         $s;
     }
     
-    method read-point($pointer is rw, $field) {
+    method !read-point($pointer is rw, $field) {
         my $x = read-varuint($!bytes, $pointer) / $field<xyscale> + $field<xorigin>;
         my $y = read-varuint($!bytes, $pointer) / $field<xyscale> + $field<yorigin>;
         my $z = read-varuint($!bytes, $pointer) / $field<zscale> + $field<zorigin> if $!has-z;
@@ -303,7 +303,7 @@ class Table does Iterable does Iterator {
         }
     }
 
-    method read-row($pointer is copy) {
+    method !read-row($pointer is copy) {
         my %row;
         note "Reading row at offset {$pointer.base(16)}" if $dbg;
         dd $!nullable-fields if $dbg;
@@ -372,7 +372,7 @@ class Table does Iterable does Iterator {
                     note "geometry type {$geometry-type} ({$geometry-type.base(16)})" if $dbg;
                     given $geometry-type +& 0xff {
                         when 1|9|11|21|52 { # point types
-                            $value = self.read-point($pointer, $field);
+                            $value = self!read-point($pointer, $field);
                         }
                         when 8|18|20|28|53 { # multipoint types
                             my @vals;
@@ -590,7 +590,7 @@ class Table does Iterable does Iterator {
         'SRID=4326;' ~ $wkt;
     }
     
-    method make-insert($row, :$name = 'XXX') {
+    method make-insert($row, :$table = 'XXX') {
         my @columns;
         my @values;
         for @!fields -> $field {
@@ -617,7 +617,7 @@ class Table does Iterable does Iterator {
                 }
             }
         }
-        "INSERT INTO $name (" ~ @columns.join(', ') ~ ") VALUES (" ~ @values.join(', ') ~ ");";
+        "INSERT INTO $table (" ~ @columns.join(', ') ~ ") VALUES (" ~ @values.join(', ') ~ ");";
     }
     
     method make-copy($row) {
@@ -665,7 +665,7 @@ class Table does Iterable does Iterator {
         "\\COPY $table (" ~ @columns.join(', ') ~ ") from '$file';";
     }
     
-    method create-table(:$name = 'XXX') {
+    method create-table(:$table = 'XXX') {
         my @geometry-columns;
         my @def;
         my @defstart;
@@ -693,7 +693,7 @@ class Table does Iterable does Iterator {
                     @def.push: $def;
                 }
                 when 6 {
-                    my $sequence-name = $name ~ '_sequence';
+                    my $sequence-name = $table ~ '_sequence';
                     @defstart.push: "CREATE SEQUENCE $sequence-name;";
                     my $def = "{$field<name>} bigint DEFAULT nextval('{$sequence-name}') PRIMARY KEY";
                     $def ~= " NOT NULL" unless $field<is-nullable>;
@@ -705,11 +705,11 @@ class Table does Iterable does Iterator {
             }
         }
         for @geometry-columns {
-            @defend.push: "SELECT AddGeometryColumn('', '{$name.lc}', '{$_.lc}', 4326, 'POINT', 2);";
-            @defend.push: "CREATE INDEX {$name}_index ON $name USING gist($_)";
+            @defend.push: "SELECT AddGeometryColumn('', '{$table.lc}', '{$_.lc}', 4326, 'POINT', 2);";
+            @defend.push: "CREATE INDEX {$table}_index ON $table USING gist($_)";
         }
         @defstart.join("\n") ~
-        "\nCREATE TABLE $name (\n  " ~
+        "\nCREATE TABLE $table (\n  " ~
         @def.join(",\n  ") ~
         "\n);\n" ~
         @defend.join("\n") ~
@@ -742,7 +742,7 @@ A class to allow easy reading of fileGDB geographic databases.
 
 FileGDB is a file format defined by ESRI and often used for transfer of geographic data information. Each database is contained in a single directory, with each database table being represented by a set of files. File names are of the form C<aXXXXXXXX.<extension>>, where C<XXXXXXXX> is a lower-case hexadecimal number. This class (at the moment) only uses files with extension C<.table> and C<.tablx> which contain the data itself and information about row positions in the data file. The other files contain information necessary and useful when the database is being actively updated and used, including indexes and information about free space.
 
-Table 1 (in files C<a00000001.table> and C<a00000001.tablx>, and usually called C<GDB_SystemCatalog>) contain the system table catalog with information about the tables in the database. The first eight tables (the number depends on the file format version, but we currently only support file version 4, correspoinding to fGDB10) contain other generic information, and not user data. The table number (and thus file names) is not stored directly in the system catalog, but is inferred from the row number in the system catalog. There are often deleted (or skipped) entries in the system catalog. These correspond to tables which are not present. Thus the file names may skip some numbers.
+Table 1 (in files C<a00000001.table> and C<a00000001.tablx>, and usually called C<GDB_SystemCatalog>) contain the system table catalog with information about the tables in the database. The first eight tables (the number depends on the file format version, but we currently only support file version 4, corresponding to fGDB10) contain other generic information, and not user data. The table number (and thus file names) is not stored directly in the system catalog, but is inferred from the row number in the system catalog. There are often deleted (or skipped) entries in the system catalog. These correspond to tables which are not present. Thus the file names may skip some numbers. In addition, tables defined in the system catalog do not necessarily exist. The existence of the files needs to be checked as well.
 
 ESRΙ do not release file format information; this module relies on the reverse-engineered information available at L<https://github.com/rouault/dump_gdbtable/wiki/FGDB-Spec>.
 
@@ -759,21 +759,69 @@ C<Table.new> will return a Failure if it cannot open the table for whatever reas
                                                                     
 The only publicly accessible attribute of a table is the number of rows, available using the C<num-rows> method.
 
-It is generally possible to use a C<Table> without actually directly calling any methods other than C<new>. In its simplest form, the following code repesents normal usage of this module:
+It is generally possible to use a C<Table> without actually directly calling any methods other than C<new>. In its simplest form, the code under "Usage example" above is all that is needed to read a table row by row.
+
+Each row is returned as a hash of column name to values. In addition the pseudo-row C<.row-num.> contains the row number in the table. For example, the system catalog table (the first table) will return rows which look like:
 
 =begin code
+  ${".row-num." => 1, :FileFormat(0), :ID(Any), :Name("GDB_SystemCatalog")}
+=end code
 
+Some auxiliary methods are available for handling some aspects of tables. For example, the following code will generate a PostgreSQL copy file and print the commands to create the tables and copy them from the file into a database. The PosgreSQL database will need to jave PostGIS installed.
+
+=begin code
+  my $system-table := Table.new(dir => $database-directory, table => 1);
+  if $system-table {
+    for $system-table => $row {
+      if $row<.row-num.> > 8 {
+        my $table = $row<Name>;
+        my $data-table := Table.new(dir => $database-directory, table => $row<.row-num.>);
+        if $data-table {
+          my $file-name = $table ~ '.copy';
+          my $copy-file = $filename.IO.open;
+          for $data-table -> $data-row {
+            $copy-file.print($data-table.make-copy($row));
+          }
+          $copy-file.close;
+          put $data-table.create-table;
+          put $data-table.make-copy-cmd($filename, $table);
+        }
+      }
+    }
+  }
 =end code
 
 =head1 Auxiliary methods
 =head2 dump
+
+The C<dump> method will "say" some information about the table which is otherwise not directly accessible. It can be convenient for debugging. C<dump> takes no arguments.
+
 =head2 iterator
+
+The C<iterator> method is part of the C<Iterator> interface. You shouldn't need to use it explicitly. )It just returns C<self> anyway.) C<iterator> takes no arguments.
+
 =head2 pull-one
-=head2 read-point
-=head2 read-row
+
+The C<pull-one> method returns the next row from the table. It is the interface used during iteration, and so is usually not explicitly called. C<pull-one> takes no arguments.
+                                                                                                        
 =head2 make-insert
+
+The <make-insert> method takes one positional  argument. This is a row of the table as returned by the iterator.  There is also a named argument C<table> which is the name of a table. The default for the table name is "XXX".
+
+The method returns a string containing a SQL insert statement which will insert the data into the table named by the C>table> argument.
+
 =head2 make-copy
+
+The C<make-copy> method takes a positional argument which is a row of the table as returned by the iterator. It's output is a string containing the row in PostgreSQL copy format.
+
 =head2 make-copy-cmd
+
+The C<make-copy-cmd> method takes two arguments. The name of a file, and an optional table name. The table name defaults to 'XXX'.
+
+The output is a string containing a PostgreSQL C<copy> command which will load the table from the given file.
+
 =head2 create-table
+
+The C<create-table> method takes a single optional named argument C<table> (default "XXX"). It returns a string containing SQL commands to create a table of the given name.
                                                                     
 =end pod
